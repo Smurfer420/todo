@@ -85,9 +85,10 @@ test("the app actually wires up GitHub gist mode and the password vault", async 
     "ghLinkBtn",
     "ntfy.sh",                       // zero-setup fallback
     "Backup to file",
-    "SERVER_MODE=false"              // no PC server in this build
+    "SERVER_MODE"                    // must NOT be there (no PC server in this build)
   ];
-  for (const s of needed) assert.ok(html.includes(s), "index.html should contain " + s);
+  for (const s of needed.slice(0, -1)) assert.ok(html.includes(s), "index.html should contain " + s);
+  assert.ok(!html.includes("SERVER_MODE"), "index.html should be free of PC-server code");
   // and the script is syntactically valid the browser can parse
   const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
   new Function(script);

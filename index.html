@@ -94,10 +94,10 @@ code{background:#00000055;padding:2px 6px;border-radius:6px;font-size:12px}
 const $ = id => document.getElementById(id);
 const listEl=$("list"), emptyEl=$("empty"), countEl=$("count"), statusEl=$("status"), dotEl=$("dot");
 const pwEl=$("pw"), connBtn=$("connBtn"), leaveBtn=$("leaveBtn"), newTodoEl=$("newTodo");
-// feature flags: true only in the full build (which ships server.js alongside this file)
-const SERVER_MODE=false, NTFY_MODE=true;
+// feature flags kept so the same file can be reused with an optional local server
+const NTFY_MODE=true;
 let state={items:{},updatedAt:0}, filter="all", connected=false, topic="", aesKey=null, es=null, lastMsgId=null, clientId=Math.random().toString(36).slice(2), publishTimer=null;
-let mode=null, token=null, serverInfo=null, pollTimer=null, pollDelay=4000, retryDelay=3000, publishQueued=false;
+let mode=null, retryDelay=3000, publishQueued=false;
 // GitHub gist mode
 let ghToken="", ghGist=null, ghEtag=null, ghInfo=null, ghTimer=null, ghPollTimer=null, ghLastPush=0, ghDirty=false;
 
@@ -132,48 +132,6 @@ async function vaultGet(){
 }
 function vaultClear(){try{localStorage.removeItem(vaultSavedKey());}catch(e){}}
 function localKey(){return connected&&topic?"synctodo-"+topic:"synctodo-local";}
-function tokenCacheKey(){return "synctodo-srv-"+location.origin;}
-async function detectServer(){
-  if(!SERVER_MODE)return null;
-  try{
-    const r=await fetch("server.json",{cache:"no-store"});
-    if(!r.ok)return null;
-    const j=await r.json();
-    if(j&&j.app==="synctodo"&&j.mode==="server")return j;
-  }catch(e){}
-  return null;
-}
-function serverUrl(p){return new URL(p,location.origin).toString();}
-async function serverPull(){
-  const r=await fetch(serverUrl("api/state?token="+token),{cache:"no-store"});
-  if(r.status===401||r.status===400){const e=new Error("bad token");e.code=401;throw e;}
-  if(!r.ok)throw new Error("HTTP "+r.status);
-  const j=await r.json();
-  if(j&&j.items)adoptRemote({items:j.items,updatedAt:j.updatedAt});
-}
-function startServerPolling(){
-  stopServerPolling();
-  const tick=async()=>{
-    try{await serverPull();pollDelay=es&&es.readyState===1?20000:4000;}
-    catch(e){pollDelay=8000;}
-    if(connected&&mode==="server")pollTimer=setTimeout(tick,pollDelay);
-  };
-  pollTimer=setTimeout(tick,pollDelay);
-}
-function stopServerPolling(){if(pollTimer){clearTimeout(pollTimer);pollTimer=null;}}
-async function serverPublish(){
-  const r=await fetch(serverUrl("api/state?token="+token),{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({items:state.items,updatedAt:state.updatedAt,from:clientId})});
-  if(!r.ok)throw new Error("HTTP "+r.status);
-  const j=await r.json();
-  if(j&&j.items)mergeRemote({items:j.items,updatedAt:j.updatedAt});
-}
-function subscribeServerEvents(){
-  if(es){try{es.close();}catch(e){}es=null;}
-  es=new EventSource(serverUrl("api/events?token="+token));
-  es.onopen=()=>{setStatus("live","Local server - saved to disk. Permanent.");pollDelay=15000;};
-  es.onmessage=ev=>{try{const d=JSON.parse(ev.data);if(d&&d.items)adoptRemote(d);}catch(e){}};
-  es.onerror=()=>{setStatus("work","Server stream down - falling back to polling.");startServerPolling();};
-}
 /* ---------------- GitHub gist mode: permanent, always on, nothing to host ---------------- */
 const GH_FILE="synctodo.enc";
 const ghTokenKey=()=>"synctodo-ghtok-"+location.host;
@@ -278,7 +236,7 @@ function adoptRemote(remote){
 }
 // Pick the newest snapshot out of a catch-up batch, then reconcile it.
 function adoptNewest(list){let best=null;for(const r of list){if(!r||!r.items)continue;if(!best||(r.updatedAt||0)>(best.updatedAt||0))best=r;}return best?adoptRemote(best):false;}
-async function publish(){if(!connected)return;if(mode==="github"){ghPush();return;}if(mode==="server"){try{await serverPublish();retryDelay=3000;publishQueued=false;}catch(e){publishQueued=true;schedulePublish(retryDelay);retryDelay=Math.min(retryDelay*2,30000);setStatus("err","Server write failed - retrying in "+(retryDelay/1000)+"s.");}return;}if(!aesKey)return;try{const payload=await encryptObj(aesKey,{items:state.items,updatedAt:state.updatedAt,from:clientId,at:Date.now()});await fetch("https://ntfy.sh/"+topic,{method:"POST",body:payload});retryDelay=3000;publishQueued=false;}catch(e){retryDelay=Math.min(retryDelay*2,30000);schedulePublish(retryDelay);setStatus("err","Sync failed - will retry automatically.");}}
+async function publish(){if(!connected)return;if(mode==="github"){ghPush();return;}if(!aesKey)return;try{const payload=await encryptObj(aesKey,{items:state.items,updatedAt:state.updatedAt,from:clientId,at:Date.now()});await fetch("https://ntfy.sh/"+topic,{method:"POST",body:payload});retryDelay=3000;publishQueued=false;}catch(e){retryDelay=Math.min(retryDelay*2,30000);schedulePublish(retryDelay);setStatus("err","Sync failed - will retry automatically.");}}
 function schedulePublish(delay){if(!connected)return;if(mode==="github"){scheduleGhPush();return;}clearTimeout(publishTimer);publishTimer=setTimeout(publish,delay||600);}
 async function catchUp(){if(!connected||mode!=="ntfy")return;try{const url="https://ntfy.sh/"+topic+"/json?poll=1"+(lastMsgId?"&since="+encodeURIComponent(lastMsgId):"");const r=await fetch(url);if(!r.ok)throw new Error("HTTP "+r.status);const txt=await r.text();const found=[];for(const line of txt.split("\n")){if(!line.trim())continue;try{const m=JSON.parse(line);if(m.event==="message"&&m.message){if(m.id)lastMsgId=m.id;if(m.message.length>200000)continue;try{const data=await decryptObj(aesKey,m.message);if(data&&data.from===clientId)continue;if(data&&data.items)found.push(data);}catch(e){/* wrong password or corrupt - ignore */}}}catch(e){}}if(found.length)adoptNewest(found);}catch(e){console.warn("catchUp",e);}}
 function subscribe(){if(es){try{es.close();}catch(e){}es=null;}es=new EventSource("https://ntfy.sh/"+topic+"/sse");es.onopen=()=>setStatus("live","Live - synced on all devices with this password.");es.onmessage=async ev=>{try{const m=JSON.parse(ev.data);if(m.event==="message"&&m.message){if(m.id)lastMsgId=m.id;if(m.message.length>200000)return;try{const data=await decryptObj(aesKey,m.message);if(data&&data.from===clientId)return;if(data&&data.items)adoptRemote(data);}catch(e){}}}catch(e){}};es.onerror=()=>setStatus("work","Reconnecting... (keeping local copy safe)");}
@@ -311,20 +269,6 @@ async function connect(){const pw=pwEl.value;if(!pw||pw.length<4){setStatus("err
   connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;
   return;
 }
-const info=await detectServer();
-if(info){
-  mode="server";serverInfo=info;connected=true;
-  token=await sha256hex("synctodo-server-v1:"+pw);
-  try{localStorage.setItem(tokenCacheKey(),token);}catch(e){}
-  load();render();
-  await serverPull();
-  subscribeServerEvents();startServerPolling();
-  await serverPublish();
-  await rememberPassword(pw);
-  setStatus("live","Connected to your local server - saved to disk on the PC. Permanent.");
-  connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;
-  return;
-}
 mode="ntfy";
 const d=await derive(pw);topic=d.topic;aesKey=d.key;connected=true;lastMsgId=null;load();render();await catchUp();subscribe();await publish();await rememberPassword(pw);setStatus("live","Live - synced via ntfy.sh (~12h cache).");connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;
 }catch(e){setStatus("err","Could not connect: "+(e&&e.message||e));connBtn.disabled=false;connected=false;mode=null;}}
@@ -342,21 +286,9 @@ async function autoConnect(){
     }catch(e){}
     $("ghBox").open=true;
   }
-  try{
-    const info=await detectServer();
-    if(info){
-      let cached=null;try{cached=localStorage.getItem(tokenCacheKey());}catch(e){}
-      if(cached){
-        mode="server";serverInfo=info;connected=true;token=cached;load();render();subscribeServerEvents();startServerPolling();
-        setStatus("live","Auto-connected to your local server. Permanent.");
-        connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;
-        return;
-      }
-    }
-  }catch(e){}
 }
 function leave(){
-  connected=false;aesKey=null;mode=null;stopServerPolling();
+  connected=false;aesKey=null;mode=null;
   clearTimeout(ghTimer);clearTimeout(ghPollTimer);
   ghGist=null;ghEtag=null;ghDirty=false;ghToken="";
   const box=$("ghInfo");box.style.display="none";box.innerHTML="";
