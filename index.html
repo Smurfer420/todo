@@ -71,7 +71,7 @@ code{background:#00000055;padding:2px 6px;border-radius:6px;font-size:12px}
 <input id="rememberPw" type="checkbox" style="width:auto;flex:0 0 auto" />
 <span>Remember my password on this device (convenience — skips the password box next visit; clears with <b>Leave</b>)</span>
 </label>
-<p class="hint">Same password on any device = same list. With the local server (<code>node server.js</code>) everything is written to a file on your PC — permanent. On plain static hosting it syncs, encrypted with AES-GCM, through <code>ntfy.sh</code>. Keep the password safe — it can't be recovered.<br><b>⬇ Backup to file</b> = your own forever copy. <b>⬆ Restore from file</b> puts a copy back.</p>
+<p class="hint">Same password on any device = same list. Everything is encrypted with your password (AES-GCM) — whoever stores it only sees gibberish. Keep the password safe; it can't be recovered.<br><b>⬇ Backup to file</b> = your own forever copy. <b>⬆ Restore from file</b> puts a copy back.</p>
 </div>
 <div class="card">
 <div class="add-row">
@@ -87,13 +87,15 @@ code{background:#00000055;padding:2px 6px;border-radius:6px;font-size:12px}
 <div class="empty" id="empty" style="display:none">Nothing here. Add one above 👆</div>
 <div class="foot"><span id="count">0 left</span><button id="clearBtn" class="ghost">Clear completed</button></div>
 </div>
-<p class="hint" style="text-align:center;margin-top:14px">One file, no account. Sync relay: <code>ntfy.sh</code> (static) or your own <code>server.js</code> (permanent).</p>
+<p class="hint" style="text-align:center;margin-top:14px">One HTML file, no account, no server. Storage: your own <b>secret GitHub gist</b>, or the public <code>ntfy.sh</code> relay.</p>
 </div>
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
 const listEl=$("list"), emptyEl=$("empty"), countEl=$("count"), statusEl=$("status"), dotEl=$("dot");
 const pwEl=$("pw"), connBtn=$("connBtn"), leaveBtn=$("leaveBtn"), newTodoEl=$("newTodo");
+// feature flags: true only in the full build (which ships server.js alongside this file)
+const SERVER_MODE=false, NTFY_MODE=true;
 let state={items:{},updatedAt:0}, filter="all", connected=false, topic="", aesKey=null, es=null, lastMsgId=null, clientId=Math.random().toString(36).slice(2), publishTimer=null;
 let mode=null, token=null, serverInfo=null, pollTimer=null, pollDelay=4000, retryDelay=3000, publishQueued=false;
 // GitHub gist mode
@@ -132,6 +134,7 @@ function vaultClear(){try{localStorage.removeItem(vaultSavedKey());}catch(e){}}
 function localKey(){return connected&&topic?"synctodo-"+topic:"synctodo-local";}
 function tokenCacheKey(){return "synctodo-srv-"+location.origin;}
 async function detectServer(){
+  if(!SERVER_MODE)return null;
   try{
     const r=await fetch("server.json",{cache:"no-store"});
     if(!r.ok)return null;

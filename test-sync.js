@@ -74,10 +74,32 @@ test("merge: stale snapshot never clobbers local edits, newer wins, deletes stic
 test("the app actually wires up GitHub gist mode and the password vault", async () => {
   const { readFile } = await import("node:fs/promises");
   const html = await readFile(new URL("./index.html", import.meta.url), "utf8");
-  for (const needed of ["api.github.com/gists", "If-None-Match", "public:false", "synctodo.enc", "indexedDB", "rememberPw", "api/state", "server.json"]) {
-    assert.ok(html.includes(needed), "index.html should contain " + needed);
-  }
-  // and the script is syntactically valid ES2017+ the browser can parse
+  const needed = [
+    "api.github.com/gists",          // gist sync
+    "If-None-Match",                 // cheap polling
+    "public:false",                  // secret, not public
+    "synctodo.enc",                  // the encrypted file name
+    "indexedDB",                     // remember-password vault
+    "rememberPw",
+    "ghGistId",                      // reuse the same list on another device
+    "ghLinkBtn",
+    "ntfy.sh",                       // zero-setup fallback
+    "Backup to file",
+    "SERVER_MODE=false"              // no PC server in this build
+  ];
+  for (const s of needed) assert.ok(html.includes(s), "index.html should contain " + s);
+  // and the script is syntactically valid the browser can parse
   const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
   new Function(script);
 });
+
+test("this build is client-only: no server files, no dependencies", async () => {
+  const { readdir, readFile } = await import("node:fs/promises");
+  const here = new URL("./", import.meta.url);
+  const files = (await readdir(here)).filter(f => !f.startsWith(".")).sort();
+  assert.deepEqual(files, ["README.md", "index.html", "test-helpers.js", "test-sync.js"], "files present: " + files.join(", "));
+  const html = await readFile(new URL("./index.html", import.meta.url), "utf8");
+  assert.equal((html.match(/<script/g) || []).length, 1, "one script tag");
+  assert.ok(!/<script[^>]+src=/.test(html), "no external scripts — nothing to host or install");
+});
+
