@@ -47,8 +47,13 @@ code{background:#00000055;padding:2px 6px;border-radius:6px;font-size:12px}
 <button id="connBtn">Connect</button>
 <button id="leaveBtn" class="ghost" style="display:none">Leave</button>
 </div>
+<div class="row" style="margin-top:8px">
+<button id="exportBtn" class="ghost" style="flex:1">⬇ Backup to file</button>
+<button id="importBtn" class="ghost" style="flex:1">⬆ Restore from file</button>
+<input id="importFile" type="file" accept="application/json,.json" style="display:none" />
+</div>
 <div class="status"><div id="dot" class="dot"></div><span id="status">Not connected — todos stay on this device only.</span></div>
-<p class="hint">Same password on any device = same list. Everything is <b>end-to-end encrypted</b> (AES-GCM) before it leaves your browser. Server only sees gibberish. Keep the password safe — it can't be recovered.<br>Tip: open this file on 2 devices, enter the same password, hit Connect.</p>
+<p class="hint">Same password on any device = same list. With the local server (<code>node server.js</code>) everything is written to a file on your PC — permanent. On plain static hosting it syncs, encrypted with AES-GCM, through <code>ntfy.sh</code>. Keep the password safe — it can't be recovered.<br><b>⬇ Backup to file</b> = your own forever copy. <b>⬆ Restore from file</b> puts a copy back.</p>
 </div>
 <div class="card">
 <div class="add-row">
@@ -64,7 +69,7 @@ code{background:#00000055;padding:2px 6px;border-radius:6px;font-size:12px}
 <div class="empty" id="empty" style="display:none">Nothing here. Add one above 👆</div>
 <div class="foot"><span id="count">0 left</span><button id="clearBtn" class="ghost">Clear completed</button></div>
 </div>
-<p class="hint" style="text-align:center;margin-top:14px">Quick &amp; simple: just this one file. Sync via <code>ntfy.sh</code> • encrypted with your password.</p>
+<p class="hint" style="text-align:center;margin-top:14px">One file, no account. Sync relay: <code>ntfy.sh</code> (static) or your own <code>server.js</code> (permanent).</p>
 </div>
 <script>
 "use strict";
@@ -72,6 +77,7 @@ const $ = id => document.getElementById(id);
 const listEl=$("list"), emptyEl=$("empty"), countEl=$("count"), statusEl=$("status"), dotEl=$("dot");
 const pwEl=$("pw"), connBtn=$("connBtn"), leaveBtn=$("leaveBtn"), newTodoEl=$("newTodo");
 let state={items:{},updatedAt:0}, filter="all", connected=false, topic="", aesKey=null, es=null, lastMsgId=null, clientId=Math.random().toString(36).slice(2), publishTimer=null;
+let mode=null, token=null, serverInfo=null, pollTimer=null, pollDelay=4000, retryDelay=3000, publishQueued=false;
 
 const te=new TextEncoder(), td=new TextDecoder();
 async function sha256hex(s){const b=await crypto.subtle.digest("SHA-256",te.encode(s));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("");}
@@ -81,6 +87,47 @@ async function derive(password){const th=await sha256hex("synctodo-topic-v1:"+pa
 async function encryptObj(key,obj){const iv=crypto.getRandomValues(new Uint8Array(12));const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},key,te.encode(JSON.stringify(obj)));return JSON.stringify({v:1,iv:b64e(iv),data:b64e(ct)});}
 async function decryptObj(key,s){const o=JSON.parse(s);if(o.v!==1)throw 0;const pt=await crypto.subtle.decrypt({name:"AES-GCM",iv:new Uint8Array(b64d(o.iv))},key,b64d(o.data));return JSON.parse(td.decode(pt));}
 function localKey(){return connected&&topic?"synctodo-"+topic:"synctodo-local";}
+function tokenCacheKey(){return "synctodo-srv-"+location.origin;}
+async function detectServer(){
+  try{
+    const r=await fetch("server.json",{cache:"no-store"});
+    if(!r.ok)return null;
+    const j=await r.json();
+    if(j&&j.app==="synctodo"&&j.mode==="server")return j;
+  }catch(e){}
+  return null;
+}
+function serverUrl(p){return new URL(p,location.origin).toString();}
+async function serverPull(){
+  const r=await fetch(serverUrl("api/state?token="+token),{cache:"no-store"});
+  if(r.status===401||r.status===400){const e=new Error("bad token");e.code=401;throw e;}
+  if(!r.ok)throw new Error("HTTP "+r.status);
+  const j=await r.json();
+  if(j&&j.items)adoptRemote({items:j.items,updatedAt:j.updatedAt});
+}
+function startServerPolling(){
+  stopServerPolling();
+  const tick=async()=>{
+    try{await serverPull();pollDelay=es&&es.readyState===1?20000:4000;}
+    catch(e){pollDelay=8000;}
+    if(connected&&mode==="server")pollTimer=setTimeout(tick,pollDelay);
+  };
+  pollTimer=setTimeout(tick,pollDelay);
+}
+function stopServerPolling(){if(pollTimer){clearTimeout(pollTimer);pollTimer=null;}}
+async function serverPublish(){
+  const r=await fetch(serverUrl("api/state?token="+token),{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({items:state.items,updatedAt:state.updatedAt,from:clientId})});
+  if(!r.ok)throw new Error("HTTP "+r.status);
+  const j=await r.json();
+  if(j&&j.items)mergeRemote({items:j.items,updatedAt:j.updatedAt});
+}
+function subscribeServerEvents(){
+  if(es){try{es.close();}catch(e){}es=null;}
+  es=new EventSource(serverUrl("api/events?token="+token));
+  es.onopen=()=>{setStatus("live","Local server - saved to disk. Permanent.");pollDelay=15000;};
+  es.onmessage=ev=>{try{const d=JSON.parse(ev.data);if(d&&d.items)mergeRemote(d);}catch(e){}};
+  es.onerror=()=>{setStatus("work","Server stream down - falling back to polling.");startServerPolling();};
+}
 function save(){try{localStorage.setItem(localKey(),JSON.stringify(state));}catch(e){}}
 function load(){try{const s=localStorage.getItem(localKey());if(s){const p=JSON.parse(s);if(p&&p.items){state=p;return;}}}catch(e){} state={items:{},updatedAt:0};}
 function visible(){return Object.values(state.items).filter(i=>!i.deleted).sort((a,b)=>b.updatedAt-a.updatedAt).filter(i=>filter==="all"?true:filter==="active"?!i.done:i.done);}
@@ -93,20 +140,80 @@ function add(){const t=newTodoEl.value.trim();if(!t)return;const id=Date.now().t
 function toggle(id){const it=state.items[id];if(!it||it.deleted)return;it.done=!it.done;it.updatedAt=Date.now();mutate();}
 function remove(id){const it=state.items[id];if(!it)return;it.deleted=true;it.updatedAt=Date.now();mutate();}
 function clearDone(){let c=false;for(const it of Object.values(state.items)){if(!it.deleted&&it.done){it.deleted=true;it.updatedAt=Date.now();c=true;}}if(c)mutate();}
-function mergeRemote(remote){if(!remote||!remote.items)return false;let changed=false;for(const [id,ri] of Object.entries(remote.items)){const li=state.items[id];if(!li||(ri.updatedAt||0)>(li.updatedAt||0)){state.items[id]=ri;changed=true;}}if((remote.updatedAt||0)>(state.updatedAt||0))state.updatedAt=remote.updatedAt;if(changed){save();render();}return changed;}
-async function publish(){if(!connected||!aesKey)return;try{const payload=await encryptObj(aesKey,{items:state.items,updatedAt:state.updatedAt,from:clientId,at:Date.now()});await fetch("https://ntfy.sh/"+topic,{method:"POST",body:payload});}catch(e){setStatus("err","Sync error — will retry. "+(e&&e.message||e));}}
-function schedulePublish(){if(!connected)return;clearTimeout(publishTimer);publishTimer=setTimeout(publish,600);}
-async function catchUp(){if(!connected)return;try{const url="https://ntfy.sh/"+topic+"/json?poll=1"+(lastMsgId?"&since="+encodeURIComponent(lastMsgId):"");const r=await fetch(url);if(!r.ok)throw new Error("HTTP "+r.status);const txt=await r.text();for(const line of txt.split("\n")){if(!line.trim())continue;try{const m=JSON.parse(line);if(m.event==="message"&&m.message){if(m.id)lastMsgId=m.id;if(m.message.length>200000)continue;try{const data=await decryptObj(aesKey,m.message);if(data&&data.from===clientId)continue;if(data&&data.items)mergeRemote(data);}catch(e){/* wrong password or corrupt — ignore */}}}catch(e){}}}catch(e){console.warn("catchUp",e);}}
-function subscribe(){if(es){try{es.close();}catch(e){}es=null;}es=new EventSource("https://ntfy.sh/"+topic+"/sse");es.onopen=()=>setStatus("live","Live - synced on all devices with this password.");es.onmessage=async ev=>{try{const m=JSON.parse(ev.data);if(m.event==="message"&&m.message){if(m.id)lastMsgId=m.id;if(m.message.length>200000)return;try{const data=await decryptObj(aesKey,m.message);if(data&&data.from===clientId)return;if(data&&data.items)mergeRemote(data);}catch(e){}}}catch(e){}};es.onerror=()=>setStatus("work","Reconnecting... (keeping local copy safe)");}
-async function connect(){const pw=pwEl.value;if(!pw||pw.length<4){setStatus("err","Use at least 4 characters for the password.");return;}connBtn.disabled=true;setStatus("work","Connecting... deriving key + catching up...");try{const d=await derive(pw);topic=d.topic;aesKey=d.key;connected=true;lastMsgId=null;load();render();await catchUp();subscribe();await publish();setStatus("live","Live - synced on all devices with this password.");connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;}catch(e){setStatus("err","Could not connect: "+(e&&e.message||e));connBtn.disabled=false;}}
-function leave(){connected=false;aesKey=null;if(es){try{es.close();}catch(e){}es=null;}clearTimeout(publishTimer);connBtn.style.display="";connBtn.disabled=false;leaveBtn.style.display="none";pwEl.disabled=false;pwEl.value="";state={items:{},updatedAt:0};load();render();setStatus("","Not connected - todos stay on this device only.");}
+function mergeRemote(remote){if(!remote||!remote.items)return false;let changed=false;const remoteAt=remote.updatedAt||0;for(const [id,ri] of Object.entries(remote.items)){const li=state.items[id];if(!li||(ri.updatedAt||0)>(li.updatedAt||0)){state.items[id]=ri;changed=true;}}if(remoteAt>(state.updatedAt||0))state.updatedAt=remoteAt;if(changed){save();render();}return changed;}
+// A cached snapshot only wins if it is newer than what we have; otherwise keep local changes.
+function adoptRemote(remote){
+  if(!remote||!remote.items)return false;
+  const remoteAt=remote.updatedAt||0, localAt=state.updatedAt||0;
+  if(remoteAt<=localAt){mergeRemote(remote);return false;}
+  const merged=Object.assign({},remote.items);
+  for(const [id,li] of Object.entries(state.items||{})){const ri=merged[id];if(!ri||(li.updatedAt||0)>(ri.updatedAt||0))merged[id]=li;}
+  state={items:merged,updatedAt:remoteAt};
+  const now=Date.now();
+  for(const it of Object.values(state.items)){if((it.updatedAt||0)>now)it.updatedAt=now;}
+  save();render();return true;
+}
+// Pick the newest snapshot out of a catch-up batch, then reconcile it.
+function adoptNewest(list){let best=null;for(const r of list){if(!r||!r.items)continue;if(!best||(r.updatedAt||0)>(best.updatedAt||0))best=r;}return best?adoptRemote(best):false;}
+async function publish(){if(!connected)return;if(mode==="server"){try{await serverPublish();retryDelay=3000;publishQueued=false;}catch(e){publishQueued=true;schedulePublish(retryDelay);retryDelay=Math.min(retryDelay*2,30000);setStatus("err","Server write failed - retrying in "+(retryDelay/1000)+"s.");}return;}if(!aesKey)return;try{const payload=await encryptObj(aesKey,{items:state.items,updatedAt:state.updatedAt,from:clientId,at:Date.now()});await fetch("https://ntfy.sh/"+topic,{method:"POST",body:payload});retryDelay=3000;publishQueued=false;}catch(e){retryDelay=Math.min(retryDelay*2,30000);schedulePublish(retryDelay);setStatus("err","Sync failed - will retry automatically.");}}
+function schedulePublish(delay){if(!connected)return;clearTimeout(publishTimer);publishTimer=setTimeout(publish,delay||600);}
+async function catchUp(){if(!connected||mode!=="ntfy")return;try{const url="https://ntfy.sh/"+topic+"/json?poll=1"+(lastMsgId?"&since="+encodeURIComponent(lastMsgId):"");const r=await fetch(url);if(!r.ok)throw new Error("HTTP "+r.status);const txt=await r.text();const found=[];for(const line of txt.split("\n")){if(!line.trim())continue;try{const m=JSON.parse(line);if(m.event==="message"&&m.message){if(m.id)lastMsgId=m.id;if(m.message.length>200000)continue;try{const data=await decryptObj(aesKey,m.message);if(data&&data.from===clientId)continue;if(data&&data.items)found.push(data);}catch(e){/* wrong password or corrupt - ignore */}}}catch(e){}}if(found.length)adoptNewest(found);}catch(e){console.warn("catchUp",e);}}
+function subscribe(){if(es){try{es.close();}catch(e){}es=null;}es=new EventSource("https://ntfy.sh/"+topic+"/sse");es.onopen=()=>setStatus("live","Live - synced on all devices with this password.");es.onmessage=async ev=>{try{const m=JSON.parse(ev.data);if(m.event==="message"&&m.message){if(m.id)lastMsgId=m.id;if(m.message.length>200000)return;try{const data=await decryptObj(aesKey,m.message);if(data&&data.from===clientId)return;if(data&&data.items)adoptRemote(data);}catch(e){}}}catch(e){}};es.onerror=()=>setStatus("work","Reconnecting... (keeping local copy safe)");}
+async function connect(){const pw=pwEl.value;if(!pw||pw.length<4){setStatus("err","Use at least 4 characters for the password.");return;}connBtn.disabled=true;setStatus("work","Connecting...");try{
+const info=await detectServer();
+if(info){
+  mode="server";serverInfo=info;connected=true;
+  token=await sha256hex("synctodo-server-v1:"+pw);
+  try{localStorage.setItem(tokenCacheKey(),token);}catch(e){}
+  load();render();
+  await serverPull();
+  subscribeServerEvents();startServerPolling();
+  await serverPublish();
+  setStatus("live","Connected to your local server - saved to disk on the PC. Permanent.");
+  connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;
+  return;
+}
+mode="ntfy";
+const d=await derive(pw);topic=d.topic;aesKey=d.key;connected=true;lastMsgId=null;load();render();await catchUp();subscribe();await publish();setStatus("live","Live - synced via ntfy.sh (~12h cache).");connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;
+}catch(e){setStatus("err","Could not connect: "+(e&&e.message||e));connBtn.disabled=false;connected=false;mode=null;}}
+async function autoConnect(){try{const info=await detectServer();if(!info)return;let cached=null;try{cached=localStorage.getItem(tokenCacheKey());}catch(e){}if(!cached)return;mode="server";serverInfo=info;connected=true;token=cached;load();render();subscribeServerEvents();startServerPolling();setStatus("live","Auto-connected to your local server. Permanent.");connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;}catch(e){}}
+function leave(){connected=false;aesKey=null;mode=null;stopServerPolling();if(es){try{es.close();}catch(e){}es=null;}clearTimeout(publishTimer);connBtn.style.display="";connBtn.disabled=false;leaveBtn.style.display="none";pwEl.disabled=false;pwEl.value="";state={items:{},updatedAt:0};load();render();setStatus("","Not connected - todos stay on this device only.");}
 connBtn.onclick=connect;leaveBtn.onclick=leave;
 pwEl.addEventListener("keydown",e=>{if(e.key==="Enter")connect();});
 $("addBtn").onclick=add;
 newTodoEl.addEventListener("keydown",e=>{if(e.key==="Enter")add();});
 $("clearBtn").onclick=clearDone;
 document.querySelectorAll(".filters button").forEach(b=>b.onclick=()=>{document.querySelectorAll(".filters button").forEach(x=>x.classList.remove("on"));b.classList.add("on");filter=b.dataset.f;render();});
-load();render();
+load();render();autoConnect();
+// Backup / restore so the list is yours to keep forever.
+$("exportBtn").onclick=()=>{
+  const clean={version:1,exportedAt:new Date().toISOString(),items:{}};
+  for(const [id,it] of Object.entries(state.items))if(!it.deleted)clean.items[id]={id,text:it.text,done:!!it.done,updatedAt:it.updatedAt};
+  const blob=new Blob([JSON.stringify(clean,null,2)],{type:"application/json"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="synctodo-backup-"+new Date().toISOString().slice(0,10)+".json";
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  setStatus("live","Backup downloaded - keep it anywhere (it's plain JSON, no password needed to read it on your own machine).");
+};
+$("importBtn").onclick=()=>$("importFile").click();
+$("importFile").onchange=async e=>{
+  const f=e.target.files&&e.target.files[0];if(!f)return;
+  try{
+    const data=JSON.parse(await f.text());
+    const items=data&&data.items?data.items:null;
+    if(!items)throw new Error("no items in file");
+    const now=Date.now();let n=0;
+    for(const id of Object.keys(items)){const it=items[id];if(!it||typeof it.text!=="string")continue;it.id=id;it.updatedAt=now+(n++);it.deleted=false;state.items[id]=it;}
+    state.updatedAt=Date.now();save();render();schedulePublish(100);
+    setStatus("live","Restored "+n+" todo(s) from file - syncing now.");
+  }catch(err){setStatus("err","Restore failed: "+(err&&err.message||err));}
+  e.target.value="";
+};
+// Never lose the last change: flush when the tab is hidden or closed.
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="hidden"&&connected&&publishQueued)schedulePublish(0);});
+window.addEventListener("pagehide",()=>{if(connected&&(publishQueued||retryDelay>3000))schedulePublish(0);});
 </script>
 </body>
 </html>
