@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SyncTodo — password-synced todos</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--card2:#0b1220;--txt:#f1f5f9;--mut:#94a3b8;--acc:#38bdf8;--acc2:#818cf8;--ok:#22c55e;--danger:#ef4444;--line:#334155}
+*{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:radial-gradient(1200px 600px at 20% -10%,#1e3a5f,transparent),radial-gradient(1000px 500px at 90% 0%,#3b1d5e,transparent),var(--bg);color:var(--txt);min-height:100vh}
+.wrap{max-width:560px;margin:0 auto;padding:28px 16px 60px}
+.brand{display:flex;align-items:center;gap:12px;margin:8px 0 18px}
+.logo{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-size:22px}
+h1{font-size:22px;margin:0}p.sub{margin:2px 0 0;color:var(--mut);font-size:13px}
+.card{background:rgba(30,41,59,.92);border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 10px 40px rgba(0,0,0,.35)}
+.sync-card{margin-bottom:14px}
+.row{display:flex;gap:8px}input[type=text],input[type=password]{flex:1;background:var(--card2);border:1px solid var(--line);color:var(--txt);border-radius:10px;padding:11px 12px;font-size:15px;outline:none;width:100%;min-width:0}
+input:focus{border-color:var(--acc)}
+button{background:linear-gradient(135deg,var(--acc),var(--acc2));border:0;color:#04121f;font-weight:700;border-radius:10px;padding:11px 14px;font-size:14px;cursor:pointer;white-space:nowrap}
+button.ghost{background:transparent;color:var(--txt);border:1px solid var(--line);font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+.status{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--mut)}
+.dot{width:10px;height:10px;border-radius:50%;background:#64748b;flex-shrink:0}.dot.live{background:var(--ok);box-shadow:0 0 10px var(--ok)}.dot.work{background:#f59e0b}.dot.err{background:var(--danger)}
+.hint{font-size:12px;color:var(--mut);margin:8px 0 0;line-height:1.5}
+.add-row{display:flex;gap:8px;margin-bottom:6px}
+.filters{display:flex;gap:6px;margin:12px 0}
+.filters button{flex:1;background:transparent;color:var(--mut);border:1px solid var(--line);font-weight:600}
+.filters button.on{color:#04121f;background:var(--txt);border-color:var(--txt)}
+ul{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
+li{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;align-items:center;gap:10px}
+li.done span.t{text-decoration:line-through;color:var(--mut)}
+.cb{width:22px;height:22px;border-radius:7px;border:2px solid var(--mut);background:transparent;cursor:pointer;display:grid;place-items:center;color:transparent;font-size:14px;padding:0;flex-shrink:0}
+li.done .cb{background:var(--ok);border-color:var(--ok);color:#04121f}
+span.t{flex:1;font-size:15px;word-break:break-word}
+.del{background:transparent;border:0;color:var(--mut);font-size:18px;cursor:pointer;padding:4px 8px}
+.del:hover{color:var(--danger)}
+.foot{display:flex;justify-content:space-between;align-items:center;margin-top:14px;font-size:13px;color:var(--mut)}
+.empty{text-align:center;color:var(--mut);padding:22px 0;font-size:14px}
+code{background:#00000055;padding:2px 6px;border-radius:6px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="brand"><div class="logo">✓</div><div><h1>SyncTodo</h1><p class="sub">one password. every device. no account.</p></div></div>
+<div class="card sync-card">
+<div class="row">
+<input id="pw" type="password" placeholder="sync password — e.g. purple-monkey-42" autocomplete="off" />
+<button id="connBtn">Connect</button>
+<button id="leaveBtn" class="ghost" style="display:none">Leave</button>
+</div>
+<div class="status"><div id="dot" class="dot"></div><span id="status">Not connected — todos stay on this device only.</span></div>
+<p class="hint">Same password on any device = same list. Everything is <b>end-to-end encrypted</b> (AES-GCM) before it leaves your browser. Server only sees gibberish. Keep the password safe — it can't be recovered.<br>Tip: open this file on 2 devices, enter the same password, hit Connect.</p>
+</div>
+<div class="card">
+<div class="add-row">
+<input id="newTodo" type="text" placeholder="What needs doing?" maxlength="300" />
+<button id="addBtn">Add</button>
+</div>
+<div class="filters">
+<button data-f="all" class="on">All</button>
+<button data-f="active">Active</button>
+<button data-f="done">Done</button>
+</div>
+<ul id="list"></ul>
+<div class="empty" id="empty" style="display:none">Nothing here. Add one above 👆</div>
+<div class="foot"><span id="count">0 left</span><button id="clearBtn" class="ghost">Clear completed</button></div>
+</div>
+<p class="hint" style="text-align:center;margin-top:14px">Quick &amp; simple: just this one file. Sync via <code>ntfy.sh</code> • encrypted with your password.</p>
+</div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const listEl=$("list"), emptyEl=$("empty"), countEl=$("count"), statusEl=$("status"), dotEl=$("dot");
+const pwEl=$("pw"), connBtn=$("connBtn"), leaveBtn=$("leaveBtn"), newTodoEl=$("newTodo");
+let state={items:{},updatedAt:0}, filter="all", connected=false, topic="", aesKey=null, es=null, lastMsgId=null, clientId=Math.random().toString(36).slice(2), publishTimer=null;
+
+const te=new TextEncoder(), td=new TextDecoder();
+async function sha256hex(s){const b=await crypto.subtle.digest("SHA-256",te.encode(s));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("");}
+function b64e(buf){return btoa(String.fromCharCode(...new Uint8Array(buf)));}
+function b64d(s){const bin=atob(s);const u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return u.buffer;}
+async function derive(password){const th=await sha256hex("synctodo-topic-v1:"+password);const kh=await sha256hex("synctodo-enc-v1:"+password);const raw=Uint8Array.from(kh.match(/../g).map(h=>parseInt(h,16)));const key=await crypto.subtle.importKey("raw",raw,"AES-GCM",false,["encrypt","decrypt"]);return {topic:"synctodo-"+th.slice(0,32),key};}
+async function encryptObj(key,obj){const iv=crypto.getRandomValues(new Uint8Array(12));const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},key,te.encode(JSON.stringify(obj)));return JSON.stringify({v:1,iv:b64e(iv),data:b64e(ct)});}
+async function decryptObj(key,s){const o=JSON.parse(s);if(o.v!==1)throw 0;const pt=await crypto.subtle.decrypt({name:"AES-GCM",iv:new Uint8Array(b64d(o.iv))},key,b64d(o.data));return JSON.parse(td.decode(pt));}
+function localKey(){return connected&&topic?"synctodo-"+topic:"synctodo-local";}
+function save(){try{localStorage.setItem(localKey(),JSON.stringify(state));}catch(e){}}
+function load(){try{const s=localStorage.getItem(localKey());if(s){const p=JSON.parse(s);if(p&&p.items){state=p;return;}}}catch(e){} state={items:{},updatedAt:0};}
+function visible(){return Object.values(state.items).filter(i=>!i.deleted).sort((a,b)=>b.updatedAt-a.updatedAt).filter(i=>filter==="all"?true:filter==="active"?!i.done:i.done);}
+function esc(s){return s.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function render(){const v=visible();listEl.innerHTML="";emptyEl.style.display=v.length?"none":"block";const left=Object.values(state.items).filter(i=>!i.deleted&&!i.done).length;countEl.textContent=left+" left";for(const t of v){const li=document.createElement("li");if(t.done)li.className="done";li.innerHTML='<button class="cb">✓</button><span class="t"></span><button class="del">×</button>';li.querySelector(".t").textContent=t.text;li.querySelector(".cb").onclick=()=>toggle(t.id);li.querySelector(".del").onclick=()=>remove(t.id);listEl.appendChild(li);}}
+function setStatus(mode,msg){dotEl.className="dot"+(mode==="live"?" live":mode==="work"?" work":mode==="err"?" err":"");statusEl.textContent=msg;}
+function touch(){state.updatedAt=Date.now();}
+function mutate(){touch();save();render();schedulePublish();}
+function add(){const t=newTodoEl.value.trim();if(!t)return;const id=Date.now().toString(36)+Math.random().toString(36).slice(2,7);state.items[id]={id,text:t.slice(0,300),done:false,updatedAt:Date.now()};newTodoEl.value="";mutate();}
+function toggle(id){const it=state.items[id];if(!it||it.deleted)return;it.done=!it.done;it.updatedAt=Date.now();mutate();}
+function remove(id){const it=state.items[id];if(!it)return;it.deleted=true;it.updatedAt=Date.now();mutate();}
+function clearDone(){let c=false;for(const it of Object.values(state.items)){if(!it.deleted&&it.done){it.deleted=true;it.updatedAt=Date.now();c=true;}}if(c)mutate();}
+function mergeRemote(remote){if(!remote||!remote.items)return false;let changed=false;for(const [id,ri] of Object.entries(remote.items)){const li=state.items[id];if(!li||(ri.updatedAt||0)>(li.updatedAt||0)){state.items[id]=ri;changed=true;}}if((remote.updatedAt||0)>(state.updatedAt||0))state.updatedAt=remote.updatedAt;if(changed){save();render();}return changed;}
+async function publish(){if(!connected||!aesKey)return;try{const payload=await encryptObj(aesKey,{items:state.items,updatedAt:state.updatedAt,from:clientId,at:Date.now()});await fetch("https://ntfy.sh/"+topic,{method:"POST",body:payload});}catch(e){setStatus("err","Sync error — will retry. "+(e&&e.message||e));}}
+function schedulePublish(){if(!connected)return;clearTimeout(publishTimer);publishTimer=setTimeout(publish,600);}
+async function catchUp(){if(!connected)return;try{const url="https://ntfy.sh/"+topic+"/json?poll=1"+(lastMsgId?"&since="+encodeURIComponent(lastMsgId):"");const r=await fetch(url);if(!r.ok)throw new Error("HTTP "+r.status);const txt=await r.text();for(const line of txt.split("\n")){if(!line.trim())continue;try{const m=JSON.parse(line);if(m.event==="message"&&m.message){if(m.id)lastMsgId=m.id;if(m.message.length>200000)continue;try{const data=await decryptObj(aesKey,m.message);if(data&&data.from===clientId)continue;if(data&&data.items)mergeRemote(data);}catch(e){/* wrong password or corrupt — ignore */}}}catch(e){}}}catch(e){console.warn("catchUp",e);}}
+function subscribe(){if(es){try{es.close();}catch(e){}es=null;}es=new EventSource("https://ntfy.sh/"+topic+"/sse");es.onopen=()=>setStatus("live","Live - synced on all devices with this password.");es.onmessage=async ev=>{try{const m=JSON.parse(ev.data);if(m.event==="message"&&m.message){if(m.id)lastMsgId=m.id;if(m.message.length>200000)return;try{const data=await decryptObj(aesKey,m.message);if(data&&data.from===clientId)return;if(data&&data.items)mergeRemote(data);}catch(e){}}}catch(e){}};es.onerror=()=>setStatus("work","Reconnecting... (keeping local copy safe)");}
+async function connect(){const pw=pwEl.value;if(!pw||pw.length<4){setStatus("err","Use at least 4 characters for the password.");return;}connBtn.disabled=true;setStatus("work","Connecting... deriving key + catching up...");try{const d=await derive(pw);topic=d.topic;aesKey=d.key;connected=true;lastMsgId=null;load();render();await catchUp();subscribe();await publish();setStatus("live","Live - synced on all devices with this password.");connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;}catch(e){setStatus("err","Could not connect: "+(e&&e.message||e));connBtn.disabled=false;}}
+function leave(){connected=false;aesKey=null;if(es){try{es.close();}catch(e){}es=null;}clearTimeout(publishTimer);connBtn.style.display="";connBtn.disabled=false;leaveBtn.style.display="none";pwEl.disabled=false;pwEl.value="";state={items:{},updatedAt:0};load();render();setStatus("","Not connected - todos stay on this device only.");}
+connBtn.onclick=connect;leaveBtn.onclick=leave;
+pwEl.addEventListener("keydown",e=>{if(e.key==="Enter")connect();});
+$("addBtn").onclick=add;
+newTodoEl.addEventListener("keydown",e=>{if(e.key==="Enter")add();});
+$("clearBtn").onclick=clearDone;
+document.querySelectorAll(".filters button").forEach(b=>b.onclick=()=>{document.querySelectorAll(".filters button").forEach(x=>x.classList.remove("on"));b.classList.add("on");filter=b.dataset.f;render();});
+load();render();
+</script>
+</body>
+</html>
