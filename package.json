@@ -6,6 +6,6 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test-server.js"
+    "test": "node --test test-sync.js test-server.js"
   }
 }

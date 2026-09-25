@@ -47,12 +47,30 @@ code{background:#00000055;padding:2px 6px;border-radius:6px;font-size:12px}
 <button id="connBtn">Connect</button>
 <button id="leaveBtn" class="ghost" style="display:none">Leave</button>
 </div>
+<details id="ghBox" style="margin-top:8px">
+<summary style="cursor:pointer;font-size:13px;color:var(--mut)">GitHub sync (permanent — keeps working when your PC is off)</summary>
+<div class="row" style="margin-top:8px">
+<input id="ghToken" type="password" placeholder="GitHub token with 'gist' scope (optional)" autocomplete="off" />
+</div>
+<div class="row" style="margin-top:8px">
+<input id="ghGistId" type="text" placeholder="Gist ID (optional — reuse the same list)" autocomplete="off" />
+<button id="ghLinkBtn" class="ghost">Link device</button>
+</div>
+<p class="hint" style="margin-top:6px">Paste a token once per device → your list is stored, encrypted with your password, in a <b>secret gist</b> in your own GitHub account. No server, stays put forever, works while your PC is off. Create one at
+<a href="https://github.com/settings/tokens/new?scopes=gist&amp;description=SyncTodo" target="_blank" rel="noopener" style="color:var(--acc)">github.com/settings/tokens</a>
+(classic token, tick <code>gist</code> only). On your other device press <b>Link device</b> to copy a ready-made link. Leave the token empty to use the public <code>ntfy.sh</code> relay instead.</p>
+<div id="ghInfo" class="hint" style="display:none"></div>
+</details>
 <div class="row" style="margin-top:8px">
 <button id="exportBtn" class="ghost" style="flex:1">⬇ Backup to file</button>
 <button id="importBtn" class="ghost" style="flex:1">⬆ Restore from file</button>
 <input id="importFile" type="file" accept="application/json,.json" style="display:none" />
 </div>
 <div class="status"><div id="dot" class="dot"></div><span id="status">Not connected — todos stay on this device only.</span></div>
+<label class="hint" style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:8px">
+<input id="rememberPw" type="checkbox" style="width:auto;flex:0 0 auto" />
+<span>Remember my password on this device (convenience — skips the password box next visit; clears with <b>Leave</b>)</span>
+</label>
 <p class="hint">Same password on any device = same list. With the local server (<code>node server.js</code>) everything is written to a file on your PC — permanent. On plain static hosting it syncs, encrypted with AES-GCM, through <code>ntfy.sh</code>. Keep the password safe — it can't be recovered.<br><b>⬇ Backup to file</b> = your own forever copy. <b>⬆ Restore from file</b> puts a copy back.</p>
 </div>
 <div class="card">
@@ -78,6 +96,8 @@ const listEl=$("list"), emptyEl=$("empty"), countEl=$("count"), statusEl=$("stat
 const pwEl=$("pw"), connBtn=$("connBtn"), leaveBtn=$("leaveBtn"), newTodoEl=$("newTodo");
 let state={items:{},updatedAt:0}, filter="all", connected=false, topic="", aesKey=null, es=null, lastMsgId=null, clientId=Math.random().toString(36).slice(2), publishTimer=null;
 let mode=null, token=null, serverInfo=null, pollTimer=null, pollDelay=4000, retryDelay=3000, publishQueued=false;
+// GitHub gist mode
+let ghToken="", ghGist=null, ghEtag=null, ghInfo=null, ghTimer=null, ghPollTimer=null, ghLastPush=0, ghDirty=false;
 
 const te=new TextEncoder(), td=new TextDecoder();
 async function sha256hex(s){const b=await crypto.subtle.digest("SHA-256",te.encode(s));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("");}
@@ -86,6 +106,29 @@ function b64d(s){const bin=atob(s);const u=new Uint8Array(bin.length);for(let i=
 async function derive(password){const th=await sha256hex("synctodo-topic-v1:"+password);const kh=await sha256hex("synctodo-enc-v1:"+password);const raw=Uint8Array.from(kh.match(/../g).map(h=>parseInt(h,16)));const key=await crypto.subtle.importKey("raw",raw,"AES-GCM",false,["encrypt","decrypt"]);return {topic:"synctodo-"+th.slice(0,32),key};}
 async function encryptObj(key,obj){const iv=crypto.getRandomValues(new Uint8Array(12));const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},key,te.encode(JSON.stringify(obj)));return JSON.stringify({v:1,iv:b64e(iv),data:b64e(ct)});}
 async function decryptObj(key,s){const o=JSON.parse(s);if(o.v!==1)throw 0;const pt=await crypto.subtle.decrypt({name:"AES-GCM",iv:new Uint8Array(b64d(o.iv))},key,b64d(o.data));return JSON.parse(td.decode(pt));}
+/* ---- optional "remember password" vault: non-extractable key in IndexedDB, ciphertext in localStorage ---- */
+const VAULT_DB="synctodo-vault", VAULT_STORE="keys";
+function idbOpen(){return new Promise((res,rej)=>{const r=indexedDB.open(VAULT_DB,1);r.onupgradeneeded=()=>{if(!r.result.objectStoreNames.contains(VAULT_STORE))r.result.createObjectStore(VAULT_STORE);};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
+async function idbGet(k){const db=await idbOpen();return new Promise((res,rej)=>{const t=db.transaction(VAULT_STORE,"readonly").objectStore(VAULT_STORE).get(k);t.onsuccess=()=>res(t.result);t.onerror=()=>rej(t.error);});}
+async function idbPut(k,v){const db=await idbOpen();return new Promise((res,rej)=>{const t=db.transaction(VAULT_STORE,"readwrite").objectStore(VAULT_STORE).put(v,k);t.onsuccess=()=>res();t.onerror=()=>rej(t.error);});}
+const vaultSavedKey=()=>"synctodo-pwsaved-"+location.host;
+async function vaultSet(pw){
+  if(!(crypto.subtle&&typeof indexedDB!=="undefined"))throw new Error("browser can't store it securely");
+  let key=await idbGet("key");
+  if(!key){key=await crypto.subtle.generateKey({name:"AES-GCM",length:256},false,["encrypt","decrypt"]);await idbPut("key",key);}
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},key,te.encode(pw));
+  localStorage.setItem(vaultSavedKey(),JSON.stringify({iv:b64e(iv),data:b64e(ct)}));
+}
+async function vaultGet(){
+  const raw=localStorage.getItem(vaultSavedKey());
+  if(!raw)return null;
+  const key=await idbGet("key");
+  if(!key)return null;
+  const o=JSON.parse(raw);
+  try{return td.decode(await crypto.subtle.decrypt({name:"AES-GCM",iv:new Uint8Array(b64d(o.iv))},key,b64d(o.data)));}catch(e){return null;}
+}
+function vaultClear(){try{localStorage.removeItem(vaultSavedKey());}catch(e){}}
 function localKey(){return connected&&topic?"synctodo-"+topic:"synctodo-local";}
 function tokenCacheKey(){return "synctodo-srv-"+location.origin;}
 async function detectServer(){
@@ -125,8 +168,85 @@ function subscribeServerEvents(){
   if(es){try{es.close();}catch(e){}es=null;}
   es=new EventSource(serverUrl("api/events?token="+token));
   es.onopen=()=>{setStatus("live","Local server - saved to disk. Permanent.");pollDelay=15000;};
-  es.onmessage=ev=>{try{const d=JSON.parse(ev.data);if(d&&d.items)mergeRemote(d);}catch(e){}};
+  es.onmessage=ev=>{try{const d=JSON.parse(ev.data);if(d&&d.items)adoptRemote(d);}catch(e){}};
   es.onerror=()=>{setStatus("work","Server stream down - falling back to polling.");startServerPolling();};
+}
+/* ---------------- GitHub gist mode: permanent, always on, nothing to host ---------------- */
+const GH_FILE="synctodo.enc";
+const ghTokenKey=()=>"synctodo-ghtok-"+location.host;
+const ghGistKey=()=>"synctodo-ghgist-"+((aesKey&&topic)||"default");
+const ghGistIdKey=()=>"synctodo-ghgistid-"+location.host;
+function ghHeaders(extra){return Object.assign({"Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28","Authorization":"Bearer "+ghToken},extra||{});}
+async function ghMe(){
+  const r=await fetch("https://api.github.com/user",{headers:ghHeaders()});
+  if(r.status===401)throw new Error("token rejected");
+  if(!r.ok)throw new Error("HTTP "+r.status);
+  return r.json();
+}
+async function ghCreate(){
+  const payload=await encryptObj(aesKey,{items:state.items,updatedAt:state.updatedAt,from:clientId,at:Date.now()});
+  const r=await fetch("https://api.github.com/gists",{method:"POST",headers:ghHeaders({"Content-Type":"application/json"}),
+    body:JSON.stringify({description:"SyncTodo list (encrypted with your password)",public:false,files:{[GH_FILE]:{content:payload}}})});
+  if(!r.ok)throw new Error("HTTP "+r.status);
+  const j=await r.json();
+  ghGist=j.id;ghEtag=r.headers.get("ETag");ghLastPush=Date.now();ghDirty=false;
+  try{localStorage.setItem(ghGistKey(),ghGist);}catch(e){}
+  try{localStorage.setItem(ghGistIdKey(),ghGist);}catch(e){}
+  return j;
+}
+async function ghLoadOne(id,inCall){
+  const headers=ghHeaders(ghEtag?{"If-None-Match":ghEtag}:{});
+  const r=await fetch("https://api.github.com/gists/"+id,{headers});
+  if(r.status===304)return null;
+  if(r.status===404){if(inCall)throw new Error("gist "+id+" not found (check the Gist ID, or leave it empty to create a new one)");ghGist=null;return null;}
+  if(r.status===401)throw new Error("token rejected");
+  if(!r.ok)throw new Error("HTTP "+r.status);
+  ghGist=id;ghEtag=r.headers.get("ETag");
+  const j=await r.json();
+  const f=j.files&&j.files[GH_FILE];
+  if(!f||!f.content){if(inCall)throw new Error("that gist has no SyncTodo data in it");return null;}
+  let remote=null;
+  try{remote=await decryptObj(aesKey,f.content);}
+  catch(e){if(inCall)throw new Error("that gist exists but this password can't open it - wrong password, or you meant a different gist");return null;}
+  if(remote&&remote.items)adoptRemote(remote);
+  return remote;
+}
+async function ghPush(){
+  if(!ghToken||!aesKey)return;
+  ghDirty=true;
+  try{
+    const payload=await encryptObj(aesKey,{items:state.items,updatedAt:state.updatedAt,from:clientId,at:Date.now()});
+    if(!ghGist){await ghCreate();ghDirty=false;retryDelay=3000;setStatus("live","Saved to your GitHub gist - permanent.");return;}
+    const r=await fetch("https://api.github.com/gists/"+ghGist,{method:"PATCH",headers:ghHeaders({"Content-Type":"application/json"}),
+      body:JSON.stringify({description:"SyncTodo list (encrypted with your password)",files:{[GH_FILE]:{content:payload}}})});
+    if(r.status===404){ghGist=null;return ghPush();}
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    ghEtag=r.headers.get("ETag");ghLastPush=Date.now();ghDirty=false;retryDelay=3000;
+    setStatus("live","Saved to your GitHub gist - permanent.");
+  }catch(e){
+    retryDelay=Math.min(retryDelay*2,60000);
+    setStatus("err","GitHub save failed (will retry): "+(e&&e.message||e));
+    scheduleGh(ghTimer,retryDelay,ghPush);
+  }
+}
+function scheduleGh(ref,delay,fn){clearTimeout(ref);return setTimeout(fn,delay);}
+function scheduleGhPush(){if(mode!=="github")return;ghTimer=scheduleGh(ghTimer,3000,ghPush);}
+async function ghPoll(){
+  if(mode!=="github")return;
+  if(document.hidden){ghPollTimer=setTimeout(ghPoll,30000);return;}
+  const id=ghGist||(()=>{try{return localStorage.getItem(ghGistKey());}catch(e){return null;}})();
+  try{
+    if(id)await ghLoadOne(id);
+    else{const j=await ghCreate();if(j&&j.id)ghGist=j.id;}
+  }catch(e){
+    if(String(e.message||"").indexOf("token rejected")>=0)setStatus("err","GitHub token rejected - re-enter it and connect again.");
+  }finally{
+    if(mode==="github")ghPollTimer=setTimeout(ghPoll,8000);
+  }
+}
+function ghConnectStart(){
+  clearTimeout(ghTimer);clearTimeout(ghPollTimer);
+  ghPollTimer=setTimeout(ghPoll,8000);
 }
 function save(){try{localStorage.setItem(localKey(),JSON.stringify(state));}catch(e){}}
 function load(){try{const s=localStorage.getItem(localKey());if(s){const p=JSON.parse(s);if(p&&p.items){state=p;return;}}}catch(e){} state={items:{},updatedAt:0};}
@@ -155,11 +275,39 @@ function adoptRemote(remote){
 }
 // Pick the newest snapshot out of a catch-up batch, then reconcile it.
 function adoptNewest(list){let best=null;for(const r of list){if(!r||!r.items)continue;if(!best||(r.updatedAt||0)>(best.updatedAt||0))best=r;}return best?adoptRemote(best):false;}
-async function publish(){if(!connected)return;if(mode==="server"){try{await serverPublish();retryDelay=3000;publishQueued=false;}catch(e){publishQueued=true;schedulePublish(retryDelay);retryDelay=Math.min(retryDelay*2,30000);setStatus("err","Server write failed - retrying in "+(retryDelay/1000)+"s.");}return;}if(!aesKey)return;try{const payload=await encryptObj(aesKey,{items:state.items,updatedAt:state.updatedAt,from:clientId,at:Date.now()});await fetch("https://ntfy.sh/"+topic,{method:"POST",body:payload});retryDelay=3000;publishQueued=false;}catch(e){retryDelay=Math.min(retryDelay*2,30000);schedulePublish(retryDelay);setStatus("err","Sync failed - will retry automatically.");}}
-function schedulePublish(delay){if(!connected)return;clearTimeout(publishTimer);publishTimer=setTimeout(publish,delay||600);}
+async function publish(){if(!connected)return;if(mode==="github"){ghPush();return;}if(mode==="server"){try{await serverPublish();retryDelay=3000;publishQueued=false;}catch(e){publishQueued=true;schedulePublish(retryDelay);retryDelay=Math.min(retryDelay*2,30000);setStatus("err","Server write failed - retrying in "+(retryDelay/1000)+"s.");}return;}if(!aesKey)return;try{const payload=await encryptObj(aesKey,{items:state.items,updatedAt:state.updatedAt,from:clientId,at:Date.now()});await fetch("https://ntfy.sh/"+topic,{method:"POST",body:payload});retryDelay=3000;publishQueued=false;}catch(e){retryDelay=Math.min(retryDelay*2,30000);schedulePublish(retryDelay);setStatus("err","Sync failed - will retry automatically.");}}
+function schedulePublish(delay){if(!connected)return;if(mode==="github"){scheduleGhPush();return;}clearTimeout(publishTimer);publishTimer=setTimeout(publish,delay||600);}
 async function catchUp(){if(!connected||mode!=="ntfy")return;try{const url="https://ntfy.sh/"+topic+"/json?poll=1"+(lastMsgId?"&since="+encodeURIComponent(lastMsgId):"");const r=await fetch(url);if(!r.ok)throw new Error("HTTP "+r.status);const txt=await r.text();const found=[];for(const line of txt.split("\n")){if(!line.trim())continue;try{const m=JSON.parse(line);if(m.event==="message"&&m.message){if(m.id)lastMsgId=m.id;if(m.message.length>200000)continue;try{const data=await decryptObj(aesKey,m.message);if(data&&data.from===clientId)continue;if(data&&data.items)found.push(data);}catch(e){/* wrong password or corrupt - ignore */}}}catch(e){}}if(found.length)adoptNewest(found);}catch(e){console.warn("catchUp",e);}}
 function subscribe(){if(es){try{es.close();}catch(e){}es=null;}es=new EventSource("https://ntfy.sh/"+topic+"/sse");es.onopen=()=>setStatus("live","Live - synced on all devices with this password.");es.onmessage=async ev=>{try{const m=JSON.parse(ev.data);if(m.event==="message"&&m.message){if(m.id)lastMsgId=m.id;if(m.message.length>200000)return;try{const data=await decryptObj(aesKey,m.message);if(data&&data.from===clientId)return;if(data&&data.items)adoptRemote(data);}catch(e){}}}catch(e){}};es.onerror=()=>setStatus("work","Reconnecting... (keeping local copy safe)");}
+async function rememberPassword(pw){
+  if($("rememberPw").checked){try{await vaultSet(pw);}catch(e){setStatus("err","Connected, but couldn't remember the password: "+(e.message||e));}}
+  else{vaultClear();}
+}
 async function connect(){const pw=pwEl.value;if(!pw||pw.length<4){setStatus("err","Use at least 4 characters for the password.");return;}connBtn.disabled=true;setStatus("work","Connecting...");try{
+  const ghTok=($("ghToken").value||"").trim();
+  const ghIdIn=($("ghGistId").value||"").trim();
+  if(ghTok||ghToken){
+    if(!ghTok)throw new Error("GitHub token missing - paste it in the GitHub sync box first.");
+    mode="github";ghToken=ghTok;connected=true;
+  try{localStorage.setItem(ghTokenKey(),ghToken);}catch(e){}
+  const d=await derive(pw);topic=d.topic;aesKey=d.key;   // password also encrypts the gist
+  load();render();
+  let who=null;
+  try{who=await ghMe();}catch(e){connected=false;mode=null;throw new Error("GitHub token problem: "+(e.message||e));}
+  try{ghGist=ghIdIn||localStorage.getItem(ghGistKey());}catch(e){ghGist=ghIdIn||null;}
+  if(ghGist){await ghLoadOne(ghGist,true);}
+  else{const j=await ghCreate();ghGist=j.id;}
+  ghInfo={login:who.login,url:"https://gist.github.com/"+ghGist};
+  $("ghGistId").value=ghGist;
+  const box=$("ghInfo");box.style.display="block";
+  box.innerHTML='Stored in <a href="'+ghInfo.url+'" target="_blank" rel="noopener" style="color:var(--acc)">gist '+ghGist.slice(0,10)+'…</a> (as <b>'+who.login+'</b>). Encrypted with your password — GitHub sees only gibberish. On another device: <b>Link device</b> → copy the link → open it there → same password.';
+  ghConnectStart();
+  schedulePublish(200);
+  await rememberPassword(pw);
+  setStatus("live","GitHub sync on - permanent, works while your PC is off.");
+  connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;
+  return;
+}
 const info=await detectServer();
 if(info){
   mode="server";serverInfo=info;connected=true;
@@ -169,15 +317,53 @@ if(info){
   await serverPull();
   subscribeServerEvents();startServerPolling();
   await serverPublish();
+  await rememberPassword(pw);
   setStatus("live","Connected to your local server - saved to disk on the PC. Permanent.");
   connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;
   return;
 }
 mode="ntfy";
-const d=await derive(pw);topic=d.topic;aesKey=d.key;connected=true;lastMsgId=null;load();render();await catchUp();subscribe();await publish();setStatus("live","Live - synced via ntfy.sh (~12h cache).");connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;
+const d=await derive(pw);topic=d.topic;aesKey=d.key;connected=true;lastMsgId=null;load();render();await catchUp();subscribe();await publish();await rememberPassword(pw);setStatus("live","Live - synced via ntfy.sh (~12h cache).");connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;
 }catch(e){setStatus("err","Could not connect: "+(e&&e.message||e));connBtn.disabled=false;connected=false;mode=null;}}
-async function autoConnect(){try{const info=await detectServer();if(!info)return;let cached=null;try{cached=localStorage.getItem(tokenCacheKey());}catch(e){}if(!cached)return;mode="server";serverInfo=info;connected=true;token=cached;load();render();subscribeServerEvents();startServerPolling();setStatus("live","Auto-connected to your local server. Permanent.");connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;}catch(e){}}
-function leave(){connected=false;aesKey=null;mode=null;stopServerPolling();if(es){try{es.close();}catch(e){}es=null;}clearTimeout(publishTimer);connBtn.style.display="";connBtn.disabled=false;leaveBtn.style.display="none";pwEl.disabled=false;pwEl.value="";state={items:{},updatedAt:0};load();render();setStatus("","Not connected - todos stay on this device only.");}
+async function autoConnect(){
+  try{const qs=new URLSearchParams(location.search).get("gist");if(qs)$("ghGistId").value=qs;}catch(e){}
+  let cachedGh=null,cachedId=null;
+  try{cachedGh=localStorage.getItem(ghTokenKey());}catch(e){}
+  try{cachedId=localStorage.getItem(ghGistIdKey());}catch(e){}
+  if(!$("ghGistId").value&&cachedId)$("ghGistId").value=cachedId;
+  if(cachedGh){
+    $("ghToken").value=cachedGh;
+    try{
+      const pw=await vaultGet();
+      if(pw){$("pw").value=pw;$("rememberPw").checked=true;await connect();return;}
+    }catch(e){}
+    $("ghBox").open=true;
+  }
+  try{
+    const info=await detectServer();
+    if(info){
+      let cached=null;try{cached=localStorage.getItem(tokenCacheKey());}catch(e){}
+      if(cached){
+        mode="server";serverInfo=info;connected=true;token=cached;load();render();subscribeServerEvents();startServerPolling();
+        setStatus("live","Auto-connected to your local server. Permanent.");
+        connBtn.style.display="none";leaveBtn.style.display="";pwEl.disabled=true;
+        return;
+      }
+    }
+  }catch(e){}
+}
+function leave(){
+  connected=false;aesKey=null;mode=null;stopServerPolling();
+  clearTimeout(ghTimer);clearTimeout(ghPollTimer);
+  ghGist=null;ghEtag=null;ghDirty=false;ghToken="";
+  const box=$("ghInfo");box.style.display="none";box.innerHTML="";
+  if(es){try{es.close();}catch(e){}es=null;}
+  clearTimeout(publishTimer);
+  connBtn.style.display="";connBtn.disabled=false;leaveBtn.style.display="none";pwEl.disabled=false;pwEl.value="";
+  $("ghToken").value="";$("rememberPw").checked=false;vaultClear();
+  state={items:{},updatedAt:0};load();render();
+  setStatus("","Not connected - todos stay on this device only.");
+}
 connBtn.onclick=connect;leaveBtn.onclick=leave;
 pwEl.addEventListener("keydown",e=>{if(e.key==="Enter")connect();});
 $("addBtn").onclick=add;
@@ -198,6 +384,13 @@ $("exportBtn").onclick=()=>{
   setStatus("live","Backup downloaded - keep it anywhere (it's plain JSON, no password needed to read it on your own machine).");
 };
 $("importBtn").onclick=()=>$("importFile").click();
+$("ghLinkBtn").onclick=async()=>{
+  const id=($("ghGistId").value||ghGist||"").trim();
+  if(!id){setStatus("err","Connect to GitHub first - then I can make a link.");return;}
+  const url=location.origin+location.pathname+"?gist="+encodeURIComponent(id);
+  try{await navigator.clipboard.writeText(url);setStatus("live","Link copied. Open it on your other device, paste your token + same password there.");}
+  catch(e){setStatus("work","Here is your link (copy it manually): "+url);}
+};
 $("importFile").onchange=async e=>{
   const f=e.target.files&&e.target.files[0];if(!f)return;
   try{
@@ -212,8 +405,18 @@ $("importFile").onchange=async e=>{
   e.target.value="";
 };
 // Never lose the last change: flush when the tab is hidden or closed.
-document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="hidden"&&connected&&publishQueued)schedulePublish(0);});
-window.addEventListener("pagehide",()=>{if(connected&&(publishQueued||retryDelay>3000))schedulePublish(0);});
+document.addEventListener("visibilitychange",()=>{
+  if(document.visibilityState!=="visible")return;
+  if(mode==="github"){
+    if(!ghPollTimer){ghPollTimer=setTimeout(ghPoll,1200);}
+    if(ghDirty)ghPush();
+  }else if(connected&&publishQueued){schedulePublish(0);}
+});
+window.addEventListener("pagehide",()=>{
+  if(!connected)return;
+  if(mode==="github"){if(ghDirty)ghPush();}
+  else if(publishQueued||retryDelay>3000)schedulePublish(0);
+});
 </script>
 </body>
 </html>
